@@ -16,6 +16,126 @@ extern volatile sig_atomic_t sigchld_flag;
 extern volatile sig_atomic_t sigint_flag;
 
 /*--------------------------------------------------------------------*/
+/* Helper Functions for Modularity of fork_exec, iter_pipe_fork_exec */
+/*--------------------------------------------------------------------*/
+/* Helper 0: Reconstruct command string for UI print */
+static char *get_command_string(DynArray_T oTokens) {
+    int i;
+    int len = dynarray_get_length(oTokens);
+    char *cmd_str = (char *)calloc(1, 1024); 
+    if (!cmd_str) return NULL;
+
+    for (i = 0; i < len; i++) {
+        struct Token *t = dynarray_get(oTokens, i);
+        
+        if (i > 0) strcat(cmd_str, " ");
+
+        switch (t->token_type) {
+            case TOKEN_WORD:
+                strcat(cmd_str, t->token_value);
+                break;
+            case TOKEN_PIPE:
+                strcat(cmd_str, "|");
+                break;
+            case TOKEN_REDIN:
+                strcat(cmd_str, "<");
+                break;
+            case TOKEN_REDOUT:
+                strcat(cmd_str, ">");
+                break;
+            case TOKEN_BG:
+                strcat(cmd_str, "&");
+                break;
+        }
+    }
+    return cmd_str;
+}
+/*--------------------------------------------------------------------*/
+/* Helper Function 1, Allocate and initialize new job */
+static struct job *init_job_struct(int is_background, int num_processes, DynArray_T oTokens) {
+    struct job *new_job = (struct job *)calloc(1, sizeof(struct job));
+    if (new_job == NULL) {
+        error_print("Cannot allocate memory for job", FPRINTF);
+        exit(EXIT_FAILURE);
+    }
+    new_job->state = is_background ? BACKGROUND : FOREGROUND;
+    new_job->remaining_processes = num_processes;
+    new_job->n_pids = num_processes;
+    new_job->cmd_line_print = get_command_string(oTokens);
+    
+    return new_job;
+}
+/*--------------------------------------------------------------------*/
+/* Helper Function 2, run inside the child process 
+ * Handles signals, redirections (file & pipe), execution.
+ * Does NOT return (calls execvp or exit).
+ */
+static void execute_child_process(DynArray_T oTokens, int start, int end, 
+                                  int in_fd, int out_fd, 
+                                  pid_t pgid, sigset_t *prev_mask) {
+    char *args[MAX_ARGS_CNT];
+
+    sigprocmask(SIG_SETMASK, prev_mask, NULL);
+
+    signal(SIGINT, SIG_DFL);
+    signal(SIGCHLD, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
+    signal(SIGTTOU, SIG_DFL);
+    signal(SIGTTIN, SIG_DFL);
+
+    if (in_fd != -1) {
+        if (dup2(in_fd, STDIN_FILENO) < 0) {
+            perror("dup2 in_fd error");
+            exit(EXIT_FAILURE);
+        }
+        close(in_fd);
+    }
+
+    if (out_fd != -1) {
+        if (dup2(out_fd, STDOUT_FILENO) < 0) {
+            perror("dup2 out_fd error");
+            exit(EXIT_FAILURE);
+        }
+        close(out_fd);
+    }
+
+    setpgid(0, pgid);
+    build_command_partial(oTokens, start, end, args);
+    if (execvp(args[0], args) < 0) {
+        fprintf(stderr, "%s: %s\n", args[0], strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+}
+/*--------------------------------------------------------------------*/
+/* Helper Function 3, Parent to finish job setup and wait,print */
+static int handle_parent_job_control(struct job *new_job, pid_t pgid, 
+                                     int is_background, sigset_t *prev_mask) {
+    int job_id;
+
+    new_job->pgid = pgid;
+
+    job_id = add_job(new_job);
+
+
+    if (!is_background) {
+        tcsetpgrp(STDIN_FILENO, pgid);
+    }
+
+    sigprocmask(SIG_SETMASK, prev_mask, NULL);
+
+    if (!is_background) {
+        wait_fg(job_id);
+        tcsetpgrp(STDIN_FILENO, getpgrp());
+    } else {
+        print_job(job_id, pgid);
+    }
+
+    return job_id;
+}
+
+
+/*--------------------------------------------------------------------*/
 void block_signal(int sig, int block) {
     sigset_t set;
     sigemptyset(&set);
@@ -37,7 +157,29 @@ void handle_sigchld(void) {
      * If the child process terminates, handle the job accordingly.
      * Be careful to handle the SIGCHLD signal flag and unblock SIGCHLD.
     */
-    
+    int status;
+    pid_t pid;
+    struct job *job;
+    int saved_errno = errno;
+
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        int i, j;
+        for (i = 0; i < MAX_JOBS; i++) {
+            if (manager->jobs[i]) {
+                job = manager->jobs[i];
+                if (remove_pid_from_job(job, pid)) {
+                    if (job->remaining_processes == 0 && job->state == BACKGROUND) {
+                        job->state = FINISHED; 
+                    } else if (job->remaining_processes == 0 && job->state == FOREGROUND) {
+                        
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    errno = saved_errno;
+
 }
 /*--------------------------------------------------------------------*/
 void handle_sigint(void) {
@@ -48,6 +190,16 @@ void handle_sigint(void) {
      * process group.
      * Be careful to handle the SIGINT signal flag and unblock SIGINT.
      */
+    int i;
+    int saved_errno = errno;
+    
+    for (i = 0; i < MAX_JOBS; i++) {
+        if (manager->jobs[i] && manager->jobs[i]->state == FOREGROUND) {
+            kill(-manager->jobs[i]->pgid, SIGINT);
+            break;
+        }
+    }
+    errno = saved_errno;
     
 }
 /*--------------------------------------------------------------------*/
@@ -72,9 +224,16 @@ void check_signals(void) {
 }
 /*--------------------------------------------------------------------*/
 void redout_handler(char *fname) {
-    /*
-     TODO: Implement redout_handler in execute.c
-    */
+    int fd;
+
+    fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        error_print(NULL, PERROR); 
+        exit(EXIT_FAILURE);
+    }
+
+    dup2_e(fd, STDOUT_FILENO, __func__, __LINE__);
+    close(fd);
 }
 /*--------------------------------------------------------------------*/
 void redin_handler(char *fname) {
@@ -257,8 +416,31 @@ int fork_exec(DynArray_T oTokens, int is_background) {
      * All terminated processes must be handled by sigchld_handler() in * snush.c. 
      */
 
-    int job_id = 1;
-    return job_id;
+    pid_t pid;
+    struct job *new_job;
+    int len = dynarray_get_length(oTokens);
+    sigset_t mask_one, prev_one;
+
+    sigemptyset(&mask_one);
+    sigaddset(&mask_one, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask_one, &prev_one);
+
+    new_job = init_job_struct(is_background, 1, oTokens);
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork error");
+        exit(EXIT_FAILURE);
+    }
+
+    if (pid == 0) { 
+        execute_child_process(oTokens, 0, len, -1, -1, 0, &prev_one);
+    }
+
+    setpgid(pid, pid); 
+    new_job->pids[0] = pid;
+
+    return handle_parent_job_control(new_job, pid, is_background, &prev_one);
 }
 /*--------------------------------------------------------------------*/
 int iter_pipe_fork_exec(int n_pipe, DynArray_T oTokens, int is_background) {
@@ -271,7 +453,69 @@ int iter_pipe_fork_exec(int n_pipe, DynArray_T oTokens, int is_background) {
      * All terminated processes must be handled by sigchld_handler() in * snush.c. 
      */
 
-    int job_id = 1;  
-    return job_id;
+    int i;
+    int num_cmds = n_pipe + 1;
+    int pipe_fd[2];
+    int prev_read_fd = -1;
+    pid_t pid;
+    pid_t pgid = 0;
+    struct job *new_job;
+    int start_idx = 0;
+    int len = dynarray_get_length(oTokens);
+    sigset_t mask_one, prev_one;
+
+    sigemptyset(&mask_one);
+    sigaddset(&mask_one, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask_one, &prev_one);
+    new_job = init_job_struct(is_background, num_cmds, oTokens);
+
+    for (i = 0; i < num_cmds; i++) {
+        int end_idx = start_idx;
+        struct Token *t;
+        int current_in_fd = prev_read_fd;
+        int current_out_fd = -1;
+
+        while (end_idx < len) {
+            t = dynarray_get(oTokens, end_idx);
+            if (t->token_type == TOKEN_PIPE) break;
+            end_idx++;
+        }
+
+        if (i < num_cmds - 1) {
+            if (pipe(pipe_fd) < 0) {
+                perror("pipe error");
+                exit(EXIT_FAILURE);
+            }
+            current_out_fd = pipe_fd[1];
+        }
+
+        pid = fork();
+        if (pid < 0) {
+            perror("fork error");
+            exit(EXIT_FAILURE);
+        }
+
+        if (pid == 0) { 
+            if (i < num_cmds - 1) close(pipe_fd[0]); 
+            
+            execute_child_process(oTokens, start_idx, end_idx, 
+                                  current_in_fd, current_out_fd, 
+                                  pgid, &prev_one);
+        }
+
+        if (i == 0) pgid = pid; 
+        setpgid(pid, pgid);
+        
+        new_job->pids[i] = pid;
+        if (prev_read_fd != -1) close(prev_read_fd);
+        if (i < num_cmds - 1) {
+            close(pipe_fd[1]); 
+            prev_read_fd = pipe_fd[0]; 
+        }
+
+        start_idx = end_idx + 1;
+    }
+
+    return handle_parent_job_control(new_job, pgid, is_background, &prev_one);
 }
 /*--------------------------------------------------------------------*/

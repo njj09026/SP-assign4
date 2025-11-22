@@ -17,24 +17,53 @@ volatile sig_atomic_t sigint_flag = 0;
 
 /*--------------------------------------------------------------------*/
 void check_bg_status() {
-    /*
-     * TODO: Implement check_bg_status()
-     */
+    int i;
+    sigset_t mask_all, prev_all;
+    sigfillset(&mask_all);
+    
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+
+    for (i = 0; i < MAX_JOBS; i++) {
+        struct job *j = manager->jobs[i];
+        if (j && j->state == FINISHED) {
+            if (j->cmd_line_print) {
+                fprintf(stdout, "[%d] FINISHED\t%s\n", j->job_id, j->cmd_line_print);
+            } else {
+                fprintf(stdout, "[%d] FINISHED\n", j->job_id);
+            }
+            fflush(stdout);
+            
+            delete_job(j->job_id);
+        }
+    }
+
+    sigprocmask(SIG_SETMASK, &prev_all, NULL);
 }
 /*--------------------------------------------------------------------*/
 void terminate_jobs() {
 
-    /*
-     * TODO: Implement terminate_jobs()
-    */
+    int i;
+    for (i = 0; i < MAX_JOBS; i++) {
+        if (manager->jobs[i]) {
+            if (manager->jobs[i]->state != FINISHED) {
+                kill(-manager->jobs[i]->pgid, SIGTERM);
+            }
+            if (manager->jobs[i]->cmd_line_print) {
+                free(manager->jobs[i]->cmd_line_print);
+            }
+            free(manager->jobs[i]);
+            manager->jobs[i] = NULL;
+        }
+    }
+    manager->n_jobs = 0;
 }
 /*--------------------------------------------------------------------*/
 void cleanup() {
     terminate_jobs();
-    /*
-     * TODO: Implement cleanup(), if necessary
-     */
-    free(manager);
+    if (manager) {
+        free(manager);
+        manager = NULL;
+    }
 }
 /*--------------------------------------------------------------------*/
 /* Do not modify this function */
